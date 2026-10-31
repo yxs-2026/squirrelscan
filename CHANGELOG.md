@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Changed
+
+- **`install.sh` is hardened at run time.** It tightens the umask to at least `022`, checks the downloaded binary's size against the manifest before the checksum, turns Ctrl-C, `SIGTERM` and `SIGHUP` into a clean exit that removes the temp directory and files the failure report, refuses `SQUIRREL_BIN_DIR` set to `/` or to only whitespace, stops with a clear message when `HOME` is unset, and retries from `~/.squirrel/tmp` when the system temp directory is mounted `noexec` (or says that is the cause). (#168)
+
 ## v0.0.147 (2026-10-31)
 
 `security/tls-certificate` now judges every key type and reads the signature and protocol, and a start URL with a broken TLS certificate reports that check failing instead of ending without a finding. A deep start URL is named in the audit, recorded as `meta.requestedUrl` and guaranteed a slot, `--include-pages` says how each page answered, and the local technology scan reads whole bundles and says when it was cut short. `security/cookie-flags` no longer warns about CSRF token cookies, and `squirrel report --input` keeps a saved report's skipped checks. The JSON report schema is now 1.3. Thanks to William for the deep start URL work (#1369, #1385).

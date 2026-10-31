@@ -25,6 +25,12 @@ fi
 
 set -euo pipefail
 
+# Nothing the installer creates (the bin directory, ~/.squirrel, the binary, the temp
+# directory) may be group or world writable, whatever umask it inherited: a permissive one
+# (0000 in some containers and CI images) would leave a world-writable directory and binary
+# on PATH. Only ever tightened: a stricter umask (077) is kept.
+umask "$(printf '%04o' "$((0$(umask) | 022))")"
+
 # squirrelscan installer
 # Usage: curl -fsSL https://install.squirrelscan.com/install.sh | bash
 # Or: curl -fsSL https://raw.githubusercontent.com/squirrelscan/squirrelscan/main/install.sh | bash
@@ -121,6 +127,8 @@ LAST_ERROR_OUTPUT=""
 # Real exit code of a failed sub-command, when it isn't the one error() exits with.
 LAST_ERROR_CODE=""
 TMPDIR_TO_CLEAN=""
+# A second staging directory, under ~/.squirrel/tmp, used when the system temp dir is noexec.
+STAGE_TO_CLEAN=""
 # Survives command-substitution subshells where LAST_ERROR_MSG can't (see error()).
 ERROR_MSG_FILE="$(mktemp 2>/dev/null || true)"
 
@@ -751,6 +759,7 @@ report_on_exit() {
   local code=$?
   set +e  # cleanup/reporting must never derail the exit path
   [ -n "$TMPDIR_TO_CLEAN" ] && rm -rf "$TMPDIR_TO_CLEAN"
+  [ -n "$STAGE_TO_CLEAN" ] && rm -rf "$STAGE_TO_CLEAN"
   # Prefer the in-process message; fall back to the file for subshell failures.
   local msg="$LAST_ERROR_MSG"
   if [ -z "$msg" ] && [ -n "${ERROR_MSG_FILE:-}" ] && [ -f "$ERROR_MSG_FILE" ]; then
@@ -769,6 +778,13 @@ report_on_exit() {
   report_error "$CURRENT_STEP" "$code" "$msg" "$LAST_ERROR_OUTPUT"
 }
 trap report_on_exit EXIT
+# bash skips EXIT traps when it is killed by an untrapped fatal signal, so Ctrl-C during a
+# download leaked the temp directory and sent no report. Turning each signal into an exit runs
+# report_on_exit: the directory is removed and the failure is reported under the step that was
+# running. 128 plus the signal number, as a shell would exit.
+trap 'LAST_ERROR_MSG="interrupted (SIGINT)"; exit 130' INT
+trap 'LAST_ERROR_MSG="terminated (SIGTERM)"; exit 143' TERM
+trap 'LAST_ERROR_MSG="hangup (SIGHUP)"; exit 129' HUP
 
 # --- Banner ---------------------------------------------------------------
 # The pixel squirrel + wordmark the CLI prints (apps/cli/src/cli/brand.ts),
@@ -1230,6 +1246,15 @@ json_get_nested() {
     sed 's/.*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1
 }
 
+# A whole-number value in the `outer` block (the manifest's `size`), or nothing.
+json_get_nested_number() {
+  local json="$1" outer="$2" inner="$3"
+  local block
+  block=$(echo "$json" | tr '\n' ' ' | grep -o "\"$outer\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1)
+  echo "$block" | grep -o "\"$inner\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" | \
+    sed 's/.*:[[:space:]]*\([0-9][0-9]*\)$/\1/' | head -1
+}
+
 # Get latest release version.
 # Primary: install.squirrelscan.com/releases/{channel} — R2-backed release
 # metadata with no rate limits. Fallback: the GitHub API, which anonymous
@@ -1288,6 +1313,21 @@ get_latest_version() {
   echo "$version"
 }
 
+# Run `<binary> self install --bin-dir <dir>` under tee into <log>, so the user sees the output live
+# and a failure can report what the binary said (#1538). Returns the binary's own exit code, not
+# tee's (PIPESTATUS[0]). The caller has `set +e` around it.
+run_self_install() {
+  local binary="$1" bin_dir="$2" log="$3"
+  # Stamp the install channel for the CLI's one-time install registration
+  # (self/install-meta.ts honors SQUIRREL_INSTALL_SOURCE; without it the
+  # managed-dir binary self-reports as the ambiguous "binary"). A caller's own
+  # value wins so wrappers (CI, package managers) can name themselves.
+  SQUIRREL_INSTALL_SOURCE="${SQUIRREL_INSTALL_SOURCE:-install-sh}" \
+    SQUIRREL_PATH_SETUP="$PATH_SETUP" \
+    "$binary" self install --bin-dir "$bin_dir" 2>&1 | tee "$log"
+  return "${PIPESTATUS[0]}"
+}
+
 # Download binary and run self install
 download_and_install() {
   local version="$1"
@@ -1318,10 +1358,11 @@ download_and_install() {
   # under `set -e` before the empty-value check below could say anything useful.
   # manifest_looks_valid already rejected a non-manifest, so this is the
   # belt-and-braces half of the same fix.
-  local filename sha256
+  local filename sha256 size=""
   if [ "$USE_JQ" = true ]; then
     filename=$(echo "$manifest" | jq -r ".binaries[\"${platform}\"].filename // empty" 2> /dev/null || true)
     sha256=$(echo "$manifest" | jq -r ".binaries[\"${platform}\"].sha256 // empty" 2> /dev/null || true)
+    size=$(echo "$manifest" | jq -r ".binaries[\"${platform}\"].size // empty" 2> /dev/null || true)
   else
     # `|| true` for the same reason as the jq branch above: json_get_nested ends
     # in a pipeline, and under `pipefail` a grep that matches nothing makes the
@@ -1329,6 +1370,7 @@ download_and_install() {
     # before the empty-value check below can say anything useful.
     filename=$(json_get_nested "$manifest" "$platform" "filename" || true)
     sha256=$(json_get_nested "$manifest" "$platform" "sha256" || true)
+    size=$(json_get_nested_number "$manifest" "$platform" "size" || true)
   fi
 
   if [ -z "$filename" ] || [ -z "$sha256" ]; then
@@ -1348,6 +1390,19 @@ download_and_install() {
   # install takes, and its output stays byte-identical to before this change.
   if [ "$DOWNLOAD_SOURCE" != "github.com" ]; then
     info "Downloaded from ${DOWNLOAD_SOURCE}"
+  fi
+
+  # Verify size. The manifest records each binary's byte count; a truncated download then fails
+  # here with a clear size mismatch, not later as a checksum mismatch. A manifest without a size
+  # (older releases) or with a value that is not a whole number skips the check.
+  CURRENT_STEP="verify_size"
+  if [[ "$size" =~ ^[0-9]+$ ]]; then
+    local actual_size
+    actual_size=$(wc -c < "$tmpdir/squirrel" | tr -d '[:space:]')
+    if [ "$actual_size" != "$size" ]; then
+      error "Size mismatch: the download is ${actual_size} bytes, the release manifest says ${size}.\n  The download was probably cut short. Run the installer again." \
+        "  If it keeps failing, download the binary by hand: https://github.com/${REPO}/releases/tag/${version}"
+    fi
   fi
 
   # Verify checksum
@@ -1372,15 +1427,33 @@ download_and_install() {
   # can report what the binary actually said instead of a bare exit code
   # (#1538). PIPESTATUS[0] is the binary's code, not tee's.
   local self_install_log="$tmpdir/self-install.log"
+  # The binary is run from here; moved to the fallback staging directory if the temp dir is noexec.
+  local exec_binary="$tmpdir/squirrel"
   set +e
-  # Stamp the install channel for the CLI's one-time install registration
-  # (self/install-meta.ts honors SQUIRREL_INSTALL_SOURCE; without it the
-  # managed-dir binary self-reports as the ambiguous "binary"). A caller's own
-  # value wins so wrappers (CI, package managers) can name themselves.
-  SQUIRREL_INSTALL_SOURCE="${SQUIRREL_INSTALL_SOURCE:-install-sh}" \
-    SQUIRREL_PATH_SETUP="$PATH_SETUP" \
-    "$tmpdir/squirrel" self install --bin-dir "$bin_dir" 2>&1 | tee "$self_install_log"
-  local rc=${PIPESTATUS[0]}
+  run_self_install "$exec_binary" "$bin_dir" "$self_install_log"
+  local rc=$?
+  # 126 with "Permission denied" is the shell failing to exec the file, which is what a temp
+  # directory mounted noexec (hardened servers, some containers) does. Stage the binary under
+  # ~/.squirrel/tmp and try once more; if that fails the same way, say what the cause is.
+  if [ "$rc" -eq 126 ] && grep -qi "permission denied" "$self_install_log" 2>/dev/null; then
+    warn "Cannot run the downloaded binary from $tmpdir (permission denied; is it mounted noexec?). Trying ~/.squirrel/tmp..."
+    local stage
+    stage=$(mkdir -p "$HOME/.squirrel/tmp" 2>/dev/null && mktemp -d "$HOME/.squirrel/tmp/install.XXXXXX" 2>/dev/null)
+    if [ -n "$stage" ] && cp "$tmpdir/squirrel" "$stage/squirrel" 2>/dev/null && chmod +x "$stage/squirrel" 2>/dev/null; then
+      STAGE_TO_CLEAN="$stage"
+      exec_binary="$stage/squirrel"
+      run_self_install "$exec_binary" "$bin_dir" "$self_install_log"
+      rc=$?
+    fi
+    if [ "$rc" -eq 126 ] && grep -qi "permission denied" "$self_install_log" 2>/dev/null; then
+      set -e
+      CURRENT_STEP="self_install_noexec"
+      LAST_ERROR_CODE="126"
+      LAST_ERROR_OUTPUT=$(tail -n 40 "$self_install_log" 2>/dev/null || true)
+      error "Cannot run the downloaded binary: permission denied (exit 126). A noexec mount is the likely cause." \
+        "  Neither $tmpdir nor ~/.squirrel/tmp allows running programs.\n  Point TMPDIR at a directory on a filesystem that does, and run the installer again:\n    TMPDIR=\$HOME/.local/tmp  (mkdir -p it first)\n  or remount the temp directory without noexec."
+    fi
+  fi
   set -e
   if [ "$rc" -ne 0 ]; then
     # Last lines, not last bytes: a byte cut can split a $HOME path so the
@@ -1395,7 +1468,7 @@ download_and_install() {
     # still run (#2023).
     CURRENT_STEP=$(self_install_step_for_code "$rc")
     if [ "$CURRENT_STEP" = "$SELF_INSTALL_KILLED_STEP" ]; then
-      install_by_hand_and_verify "$tmpdir/squirrel" "$version" "$bin_dir" "$rc"
+      install_by_hand_and_verify "$exec_binary" "$version" "$bin_dir" "$rc"
       return 0
     fi
     error "Self install failed with exit code $rc"
@@ -1670,8 +1743,39 @@ print_path_instructions() {
   echo "After updating PATH, verify with: squirrel self doctor"
 }
 
+# Refuse to start without a home directory: every path below hangs off $HOME, and under
+# `set -u` an unset one used to kill the script mid-run with `HOME: unbound variable`.
+check_home() {
+  if [ -z "${HOME:-}" ]; then
+    error "HOME is not set, so there is nowhere to install to." \
+      "  Set it for this run:  HOME=/home/you ... \n  or choose the install directory:  SQUIRREL_BIN_DIR=/path/to/bin"
+  fi
+}
+
+# Refuse a SQUIRREL_BIN_DIR that is only whitespace or the filesystem root: the installer would
+# write the binary link into / (or into a directory named with spaces). Unset or empty means "not
+# set", as before.
+check_bin_dir_override() {
+  [ -n "${SQUIRREL_BIN_DIR:-}" ] || return 0
+  local trimmed="${SQUIRREL_BIN_DIR//[[:space:]]/}" stripped
+  if [ -z "$trimmed" ]; then
+    error "SQUIRREL_BIN_DIR is set but contains only whitespace." \
+      "  Unset it to use the default, or give a directory:  SQUIRREL_BIN_DIR=\$HOME/.local/bin"
+  fi
+  stripped="$trimmed"
+  while [ "${stripped%/}" != "$stripped" ]; do stripped="${stripped%/}"; done
+  if [ -z "$stripped" ]; then
+    error "SQUIRREL_BIN_DIR=$SQUIRREL_BIN_DIR is the filesystem root; refusing to install there." \
+      "  Give a directory of your own:  SQUIRREL_BIN_DIR=\$HOME/.local/bin"
+  fi
+}
+
 main() {
   local channel="${SQUIRREL_CHANNEL:-stable}"
+
+  CURRENT_STEP="check_environment"
+  check_home
+  check_bin_dir_override
 
   print_banner
 
